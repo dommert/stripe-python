@@ -2,26 +2,13 @@ import calendar
 import datetime
 import platform
 import time
-import socket
 import urllib
 import urlparse
 import warnings
 
 import stripe
-from stripe import error, http_client, version, util, certificate_blacklist
-
-try:
-    import ssl
-except ImportError:
-    if util.is_appengine_dev():
-        warnings.warn(
-            'We were unable to import the ssl module due to a bug in the '
-            'Google App Engine development server. For more details and '
-            'suggested resolutions see: '
-            'https://code.google.com/p/googleappengine/issues/detail?id=9246.'
-            'Please alert us immediately at support@stripe.com if this '
-            'message appears in your production logs.')
-    raise
+from stripe import error, http_client, version, util
+from stripe.multipart_data_generator import MultipartDataGenerator
 
 
 def _encode_datetime(dttime):
@@ -33,6 +20,13 @@ def _encode_datetime(dttime):
     return int(utc_timestamp)
 
 
+def _encode_nested_dict(key, data, fmt='%s[%s]'):
+    d = {}
+    for subkey, subvalue in data.iteritems():
+        d[fmt % (key, subkey)] = subvalue
+    return d
+
+
 def _api_encode(data):
     for key, value in data.iteritems():
         key = util.utf8(key)
@@ -41,11 +35,15 @@ def _api_encode(data):
         elif hasattr(value, 'stripe_id'):
             yield (key, value.stripe_id)
         elif isinstance(value, list) or isinstance(value, tuple):
-            for subvalue in value:
-                yield ("%s[]" % (key,), util.utf8(subvalue))
+            for sv in value:
+                if isinstance(sv, dict):
+                    subdict = _encode_nested_dict(key, sv, fmt='%s[][%s]')
+                    for k, v in _api_encode(subdict):
+                        yield (k, v)
+                else:
+                    yield ("%s[]" % (key,), util.utf8(sv))
         elif isinstance(value, dict):
-            subdict = dict(('%s[%s]' % (key, subkey), subvalue) for
-                           subkey, subvalue in value.iteritems())
+            subdict = _encode_nested_dict(key, value)
             for subkey, subvalue in _api_encode(subdict):
                 yield (subkey, subvalue)
         elif isinstance(value, datetime.datetime):
@@ -65,15 +63,17 @@ def _build_api_url(url, query):
 
 class APIRequestor(object):
 
-    _CERTIFICATE_VERIFIED = False
-
-    def __init__(self, key=None, client=None):
+    def __init__(self, key=None, client=None, api_base=None, account=None):
+        self.api_base = api_base or stripe.api_base
         self.api_key = key
+        self.stripe_account = account
 
-        from stripe import verify_ssl_certs
+        from stripe import verify_ssl_certs as verify
+        from stripe import proxy
 
-        self._client = client or http_client.new_default_http_client(
-            verify_ssl_certs=verify_ssl_certs)
+        self._client = client or stripe.default_http_client or \
+            http_client.new_default_http_client(
+                verify_ssl_certs=verify, proxy=proxy)
 
     @classmethod
     def api_url(cls, url=''):
@@ -134,14 +134,13 @@ class APIRequestor(object):
             DeprecationWarning)
         return _build_api_url(url, cls.encode(params))
 
-    def request(self, method, url, params=None):
-        self._check_ssl_cert()
-        rbody, rcode, my_api_key = self.request_raw(
-            method.lower(), url, params)
-        resp = self.interpret_response(rbody, rcode)
+    def request(self, method, url, params=None, headers=None):
+        rbody, rcode, rheaders, my_api_key = self.request_raw(
+            method.lower(), url, params, headers)
+        resp = self.interpret_response(rbody, rcode, rheaders)
         return resp, my_api_key
 
-    def handle_api_error(self, rbody, rcode, resp):
+    def handle_api_error(self, rbody, rcode, resp, rheaders):
         try:
             err = resp['error']
         except (KeyError, TypeError):
@@ -150,19 +149,31 @@ class APIRequestor(object):
                 "was %d)" % (rbody, rcode),
                 rbody, rcode, resp)
 
-        if rcode in [400, 404]:
+        # Rate limits were previously coded as 400's with code 'rate_limit'
+        if rcode == 429 or (rcode == 400 and err.get('code') == 'rate_limit'):
+            raise error.RateLimitError(
+                err.get('message'), rbody, rcode, resp, rheaders)
+        elif rcode in [400, 404]:
             raise error.InvalidRequestError(
-                err.get('message'), err.get('param'), rbody, rcode, resp)
+                err.get('message'), err.get('param'),
+                rbody, rcode, resp, rheaders)
         elif rcode == 401:
             raise error.AuthenticationError(
-                err.get('message'), rbody, rcode, resp)
+                err.get('message'), rbody, rcode, resp,
+                rheaders)
         elif rcode == 402:
             raise error.CardError(err.get('message'), err.get('param'),
-                                  err.get('code'), rbody, rcode, resp)
+                                  err.get('code'), rbody, rcode, resp,
+                                  rheaders)
+        elif rcode == 403:
+            raise error.PermissionError(
+                err.get('message'), rbody, rcode, resp,
+                rheaders)
         else:
-            raise error.APIError(err.get('message'), rbody, rcode, resp)
+            raise error.APIError(err.get('message'), rbody, rcode, resp,
+                                 rheaders)
 
-    def request_raw(self, method, url, params=None):
+    def request_raw(self, method, url, params=None, supplied_headers=None):
         """
         Mechanism for issuing an API call
         """
@@ -182,7 +193,7 @@ class APIRequestor(object):
                 'for details, or email support@stripe.com if you have any '
                 'questions.')
 
-        abs_url = '%s%s' % (stripe.api_base, url)
+        abs_url = '%s%s' % (self.api_base, url)
 
         encoded_params = urllib.urlencode(list(_api_encode(params or {})))
 
@@ -191,7 +202,16 @@ class APIRequestor(object):
                 abs_url = _build_api_url(abs_url, encoded_params)
             post_data = None
         elif method == 'post':
-            post_data = encoded_params
+            if supplied_headers is not None and \
+                    supplied_headers.get("Content-Type") == \
+                    "multipart/form-data":
+                generator = MultipartDataGenerator()
+                generator.add_params(params or {})
+                post_data = generator.get_post_data()
+                supplied_headers["Content-Type"] = \
+                    "multipart/form-data; boundary=%s" % (generator.boundary,)
+            else:
+                post_data = encoded_params
         else:
             raise error.APIConnectionError(
                 'Unrecognized HTTP method %r.  This may indicate a bug in the '
@@ -209,7 +229,7 @@ class APIRequestor(object):
                            ['uname', lambda: ' '.join(platform.uname())]]:
             try:
                 val = func()
-            except Exception, e:
+            except Exception as e:
                 val = "!! %s" % (e,)
             ua[attr] = val
 
@@ -219,22 +239,35 @@ class APIRequestor(object):
             'Authorization': 'Bearer %s' % (my_api_key,)
         }
 
+        if self.stripe_account:
+            headers['Stripe-Account'] = self.stripe_account
+
         if method == 'post':
             headers['Content-Type'] = 'application/x-www-form-urlencoded'
 
         if api_version is not None:
             headers['Stripe-Version'] = api_version
 
-        rbody, rcode = self._client.request(
+        if supplied_headers is not None:
+            for key, value in supplied_headers.items():
+                headers[key] = value
+
+        util.log_info('Request to Stripe api', method=method, path=abs_url)
+        util.log_debug(
+            'Post details', post_data=post_data, api_version=api_version)
+
+        rbody, rcode, rheaders = self._client.request(
             method, abs_url, headers, post_data)
 
-        util.logger.info(
-            'API request to %s returned (response code, response body) of '
-            '(%d, %r)',
-            abs_url, rcode, rbody)
-        return rbody, rcode, my_api_key
+        util.log_info(
+            'Stripe API response', path=abs_url, response_code=rcode)
+        util.log_debug('API response body', body=rbody)
+        if 'Request-Id' in rheaders:
+            util.log_debug('Dashboard link for request',
+                           link=util.dashboard_link(rheaders['Request-Id']))
+        return rbody, rcode, rheaders, my_api_key
 
-    def interpret_response(self, rbody, rcode):
+    def interpret_response(self, rbody, rcode, rheaders):
         try:
             if hasattr(rbody, 'decode'):
                 rbody = rbody.decode('utf-8')
@@ -243,49 +276,17 @@ class APIRequestor(object):
             raise error.APIError(
                 "Invalid response body from API: %s "
                 "(HTTP response code was %d)" % (rbody, rcode),
-                rbody, rcode)
+                rbody, rcode, rheaders)
         if not (200 <= rcode < 300):
-            self.handle_api_error(rbody, rcode, resp)
+            util.log_info(
+                'Stripe API error received',
+                error_code=resp.get('error', {}).get('code'),
+                error_type=resp.get('error', {}).get('type'),
+                error_message=resp.get('error', {}).get('message'),
+                error_param=resp.get('error', {}).get('param'),
+            )
+            self.handle_api_error(rbody, rcode, resp, rheaders)
         return resp
-
-    def _check_ssl_cert(self):
-        """Preflight the SSL certificate presented by the backend.
-
-        This isn't 100% bulletproof, in that we're not actually validating the
-        transport used to communicate with Stripe, merely that the first
-        attempt to does not use a revoked certificate.
-
-        Unfortunately the interface to OpenSSL doesn't make it easy to check
-        the certificate before sending potentially sensitive data on the wire.
-        This approach raises the bar for an attacker significantly."""
-
-        from stripe import verify_ssl_certs
-
-        if verify_ssl_certs and not self._CERTIFICATE_VERIFIED:
-            uri = urlparse.urlparse(stripe.api_base)
-            try:
-                certificate = ssl.get_server_certificate(
-                    (uri.hostname, uri.port or 443))
-                der_cert = ssl.PEM_cert_to_DER_cert(certificate)
-            except socket.error, e:
-                raise error.APIConnectionError(e)
-            except TypeError:
-                # The Google App Engine development server blocks the C socket
-                # module which causes a type error when using the SSL library
-                if util.is_appengine_dev():
-                    self._CERTIFICATE_VERIFIED = True
-                    warnings.warn(
-                        'We were unable to verify Stripe\'s SSL certificate '
-                        'due to a bug in the Google App Engine development '
-                        'server. Please alert us immediately at '
-                        'support@stripe.com if this message appears in your '
-                        'production logs.')
-                    return
-                else:
-                    raise
-
-            self._CERTIFICATE_VERIFIED = certificate_blacklist.verify(
-                uri.hostname, der_cert)
 
     # Deprecated request handling.  Will all be removed in 2.0
     def _deprecated_request(self, impl, method, url, headers, params):

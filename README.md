@@ -6,11 +6,11 @@ You don't need this source code unless you want to modify the
 package. If you just want to use the Stripe Python bindings, you
 should run:
 
-    pip install --index-url https://code.stripe.com --upgrade stripe
+    pip install --upgrade stripe
 
 or
 
-    easy_install --index-url https://code.stripe.com --upgrade stripe
+    easy_install --upgrade stripe
 
 See http://www.pip-installer.org/en/latest/index.html for instructions
 on installing pip. If you are on a system with easy_install but not
@@ -26,9 +26,45 @@ To install from source, run:
 
 Please see https://stripe.com/docs/api/python for the most up-to-date documentation.
 
+## Logging
+
+There are a few ways to get some insight into what requests and responses the client is making and getting back from the Stripe API.
+The python client can be told to emit either `debug` or `info` logs.
+`debug` will give more verbose information, and `info` will be more compact, but omit things like request/response bodies.
+
+You can enable logging in a few ways:
+    1. Set the environment variable `STRIPE_LOG` to the value `debug` or to `info`
+       ```
+       $ export STRIPE_LOG=debug
+       ```
+    2. set `stripe.log` to `'debug'` or `'info'`
+       ```py
+       import stripe
+       stripe.log = 'debug'
+       ```
+    3. Set up python logging and set the logging level to the level you desire
+       ```py
+       import logging
+       logging.basicConfig()
+       logging.getLogger('stripe').setLevel(logging.DEBUG)
+       ```
+
+If you are running code in production, it's preferable to set up [python logging explicitly](https://docs.python.org/2/library/logging.html). This will give you control over filtering logs, and where the logs are output. Using the `STRIPE_LOG` and `stripe.log` methods will always result in logs going to standard out, which you may or may not want.
+
+Note that setting `stripe.log` will supersede the setting of `STRIPE_LOG`, but it can be turned off by setting it back to `None`. Example:
+
+```py
+import os
+import stripe
+
+print os.environ['STRIPE_LOG']  # => 'info'
+stripe.log = 'debug'  # debug logs will also print now
+stripe.log = None  # now only info logs will print
+```
+
 ## Testing
 
-We commit to being compatible with Python 2.6+, Python 3.1+ and PyPy.  We need to test against all of these environments to ensure compatibility.  Travis CI will automatically run our tests on push.  For local testing, we use [tox](http://tox.readthedocs.org/) to handle testing across environments.
+We commit to being compatible with Python 2.6+, Python 3.3+ and PyPy.  We need to test against all of these environments to ensure compatibility.  Travis CI will automatically run our tests on push.  For local testing, we use [tox](http://tox.readthedocs.org/) to handle testing across environments.
 
 ### Setting up tox
 
@@ -44,9 +80,9 @@ Note that PyCurl doesn't currently play nicely with our tox configuration.  Tox 
 
 ### Running specific tests
 
-You can specify a module, TestCase or single test to run by passing it as an argument to tox.  For example, to run only the `test_save` test of the `UpdateableAPIResourceTests` case from the `test_resources` module on Python 2.7:
+You can specify a module, TestCase or single test to run by passing it as an argument to tox.  For example, to run only the `test_save` test of the `UpdateableAPIResourceTests` case from the `test.resources` module on Python 2.7:
 
-    tox -e py27 -- --test-suite stripe.test.test_resources.UpdateableAPIResourceTests.test_save
+    tox -e py27 -- --test-suite stripe.test.resources.test_updateable.UpdateableAPIResourceTests.test_save
 
 ### Linting
 
